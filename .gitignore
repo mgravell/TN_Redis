@@ -1,0 +1,6 @@
+bin/
+obj/
+*.user
+nohup.out
+# throwaway self-signed test certs; see README for how to generate
+certs/

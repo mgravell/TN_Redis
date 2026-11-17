@@ -1,0 +1,265 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.ComponentModel;
+using System.Globalization;
+using System.Net;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Networking.Shared;
+
+namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Networking.Epoll;
+
+internal sealed class TcpConnection(EpollWorker engine, ulong id, int fd, IPEndPoint local, IPEndPoint remote, TaskCompletionSource<IProviderConnection>? connect = null) : ConnectionState(id, local, remote)
+{
+    private const int WriteBudget = 256 * 1024;
+    // A client may write a whole request before reading the response, so it needs a receive window far larger than a server's to keep an echoing peer unblocked.
+    private static readonly int ClientLeaseBytes = int.Parse(Environment.GetEnvironmentVariable("NETWORKPROTO_CLIENT_LEASE_BYTES") ?? "1048576", CultureInfo.InvariantCulture);
+    private readonly int _maxLeased = connect is null ? 4 : Math.Max(2, ClientLeaseBytes / engine.PageBytes);
+    private int _fd = fd, _sendLength, _sendOffset;
+    private nint _sendData;
+    private uint _interest;
+    private bool _registered, _readPaused, _readEnded, _finalSend;
+
+    internal override void Drive(uint ready)
+    {
+        if (Closed)
+        {
+            return;
+        }
+        Application ??= connect is null ? engine.Publish(this) : engine.PublishClient(this, connect);
+        if (_sendData != 0 && (ready & Native.Writable) != 0)
+        {
+            Write();
+        }
+        if (!Closed && !_readPaused && !_readEnded && (ready & Native.Readable) != 0)
+        {
+            Read();
+        }
+        UpdateInterest();
+    }
+
+    internal override void Send(nint data, int length, bool final)
+    {
+        if (Closed)
+        {
+            Application!.Sent(-125);
+            return;
+        }
+        if (_sendData != 0 || data == 0 || length <= 0)
+        {
+            throw new InvalidOperationException("Invalid concurrent epoll TCP send.");
+        }
+        _sendData = data;
+        _sendLength = length;
+        _sendOffset = 0;
+        _finalSend = final;
+        if (final && engine.CorkFinal)
+        {
+            Native.Check(Native.SetSocketOption(_fd, Native.SocketOption.Cork, 1), "TCP_CORK");
+            engine.Metrics.Corks++;
+        }
+        Write();
+        UpdateInterest();
+    }
+
+    private void Write()
+    {
+        var budget = WriteBudget;
+        while (_sendData != 0 && budget > 0)
+        {
+            var length = Math.Min(_sendLength - _sendOffset, budget);
+            engine.Metrics.SendCalls++;
+            var count = Native.Send(_fd, _sendData + _sendOffset, length);
+            if (count == Native.Again)
+            {
+                engine.Metrics.SendWouldBlock++;
+                return;
+            }
+            if (count <= 0)
+            {
+                SocketError(count == 0 ? Native.BrokenPipe : count, "send");
+                return;
+            }
+            if (count < length)
+            {
+                engine.Metrics.PartialSends++;
+            }
+            NativeSendTrace.Write(engine.Logger, _sendData + _sendOffset, count);
+            engine.Metrics.SendBytes += count;
+            _sendOffset += count;
+            budget -= count;
+            if (_sendOffset == _sendLength)
+            {
+                _sendData = 0;
+                Application!.Sent(_sendLength);
+                if (_finalSend)
+                {
+                    Finish(null);
+                }
+            }
+        }
+    }
+
+    private unsafe void Read()
+    {
+        while (Leased < _maxLeased)
+        {
+            var page = engine.RentPage(Id);
+            if (page < 0)
+            {
+                break;
+            }
+            int count;
+            engine.Metrics.RecvCalls++;
+            fixed (byte* pointer = engine.Page(page).Span)
+            {
+                count = Native.Receive(_fd, (nint)pointer, engine.PageBytes);
+            }
+            if (count <= 0)
+            {
+                engine.OfferPage(Id, page);
+                if (count == Native.Again)
+                {
+                    engine.Metrics.ReceiveWouldBlock++;
+                }
+                else if (count == 0)
+                {
+                    // A TCP half-close ends input, not the response still being produced.
+                    _readEnded = true;
+                    engine.Metrics.ReadEofs++;
+                    Application!.EndReceive(null);
+                }
+                else
+                {
+                    SocketError(count, "recv");
+                }
+                return;
+            }
+            engine.Metrics.RecvBytes += count;
+            Leased++;
+            engine.Received(Application!, page, count);
+            // Level-triggered epoll will report any remaining input. Do not make
+            // another usually-empty recv after the common small request.
+            if (count < engine.PageBytes && Leased < _maxLeased)
+            {
+                return;
+            }
+        }
+        _readPaused = true;
+        engine.Metrics.ReadPauses++;
+    }
+
+    private void UpdateInterest()
+    {
+        if (Closed)
+        {
+            return;
+        }
+        var mask = (_readPaused || _readEnded ? 0 : Native.Readable) | (_sendData != 0 ? Native.Writable : 0);
+        if (mask == 0)
+        {
+            if (_registered)
+            {
+                engine.Control(Native.Delete, _fd, 0, Id);
+                _registered = false;
+            }
+        }
+        else if (!_registered || mask != _interest)
+        {
+            engine.Control(_registered ? Native.Modify : Native.Add, _fd, mask, Id);
+            _registered = true;
+            _interest = mask;
+        }
+    }
+
+    internal override void ReturnPage(int page)
+    {
+        if (Leased <= 0)
+        {
+            throw new InvalidOperationException("Epoll TCP page lease returned twice.");
+        }
+        engine.OfferPage(Id, page);
+        Leased--;
+        engine.Metrics.ReturnedPages++;
+        ResumeReader();
+    }
+
+    internal override void ResumeForPool()
+    {
+        if (!Closed && _readPaused && Leased < _maxLeased)
+        {
+            engine.Metrics.PageResumes++;
+            ResumeReader();
+        }
+    }
+
+    private void ResumeReader()
+    {
+        if (!Closed && _readPaused && Leased < _maxLeased)
+        {
+            _readPaused = false;
+            Drive(Native.Readable);
+        }
+    }
+
+    private void SocketError(int result, string operation)
+    {
+        Exception error;
+        if (result is Native.ConnectionReset or Native.BrokenPipe)
+        {
+            engine.Metrics.PeerAborts++;
+            error = new ConnectionResetException($"Epoll TCP peer disconnected during {operation}: {result}.");
+        }
+        else
+        {
+            engine.Metrics.SocketErrors++;
+            error = new IOException($"Epoll TCP {operation} failed.", new Win32Exception(-result));
+            engine.Logger.LogError(error, "Epoll TCP operation failed.");
+        }
+        Finish(error);
+    }
+
+    internal override void RequestClose()
+    {
+        Finish(_sendData == 0 ? null : new ConnectionAbortedException("Epoll TCP closed with pending output."));
+    }
+
+    internal override void Finish(Exception? error)
+    {
+        if (Closed)
+        {
+            return;
+        }
+        Closed = true;
+        try
+        {
+            if (_registered)
+            {
+                engine.Control(Native.Delete, _fd, 0, Id);
+            }
+        }
+        finally
+        {
+            _registered = false;
+            var result = Native.Shutdown(_fd);
+            if (result == 0 && _finalSend && error is null)
+            {
+                engine.Metrics.FinalShutdowns++;
+            }
+            else if (result == Native.NotConnected)
+            {
+                engine.Metrics.NotConnected++;
+            }
+            else if (result < 0)
+            {
+                engine.Metrics.ShutdownFailures++;
+                engine.Logger.LogError("Epoll TCP shutdown failed: {Error}", result);
+            }
+            engine.CloseDescriptor(ref _fd);
+            _sendData = 0;
+            engine.Metrics.Closed++;
+            Application!.Closed(error);
+        }
+    }
+}

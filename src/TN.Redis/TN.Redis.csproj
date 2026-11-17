@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- SER009: the RESPite transport seam is [Experimental]; consuming it is the point (same as
+         SocketSet.StackExchange.Redis). -->
+    <NoWarn>$(NoWarn);SER009;StringToRedisValue</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../NetworkTransport/NetworkTransport.csproj" />
+    <!-- Cross-repo sibling references, same arrangement as SocketSet.StackExchange.Redis:
+         /home/marc/code/StackExchange.Redis at or after the SER009 merge (#3152). -->
+    <ProjectReference Include="../../../StackExchange.Redis/src/RESPite/RESPite.csproj" />
+    <ProjectReference Include="../../../StackExchange.Redis/src/StackExchange.Redis/StackExchange.Redis.csproj" />
+  </ItemGroup>
+
+  <Target Name="RequireSiblingCheckout" BeforeTargets="BeforeBuild"
+          Condition="!Exists('../../../StackExchange.Redis/src/RESPite/RESPite.csproj')">
+    <Error Text="TN.Redis needs a sibling StackExchange.Redis checkout with SER009 merged." />
+  </Target>
+
+</Project>

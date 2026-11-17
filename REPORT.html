@@ -1,0 +1,163 @@
+<title>Transport.Networking × SE.Redis</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap">
+<style>
+/* Layout: single 720px reading column; findings numbered because the report's sections are cited by number. */
+:root {
+  --bg: #faf9f7;
+  --surface: #ffffff;
+  --fg: #1f2329;
+  --muted: #5b6471;
+  --line: #e3e0da;
+  --accent: #0e6e6a;
+  --accent-soft: #e3efee;
+  --bad: #b3372f;
+  --bad-soft: #f7e8e6;
+  --good: #2c6e49;
+  --good-soft: #e7f0ea;
+  --warn: #8a6410;
+  --warn-soft: #f5edda;
+  --code-bg: #f0eeea;
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  --font-body: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #15181c; --surface: #1c2026; --fg: #e8e6e1; --muted: #9aa3ad; --line: #2d333b;
+  --accent: #4db6ac; --accent-soft: #15302e; --bad: #e07a70; --bad-soft: #3a211f;
+  --good: #7fbf98; --good-soft: #1e3026; --warn: #d4a94c; --warn-soft: #352b14;
+  --code-bg: #23272e; color-scheme: dark;
+} }
+:root[data-theme="dark"] {
+  --bg: #15181c; --surface: #1c2026; --fg: #e8e6e1; --muted: #9aa3ad; --line: #2d333b;
+  --accent: #4db6ac; --accent-soft: #15302e; --bad: #e07a70; --bad-soft: #3a211f;
+  --good: #7fbf98; --good-soft: #1e3026; --warn: #d4a94c; --warn-soft: #352b14;
+  --code-bg: #23272e; color-scheme: dark;
+}
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--font-body);
+  font-size: 16px; line-height: 1.65; margin: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0 4rem;
+}
+main { max-width: 720px; margin: 0 auto; }
+header.doc { border-bottom: 2px solid var(--fg); padding: 3rem 0 1.25rem; margin-bottom: 2rem; }
+.eyebrow { font-family: var(--font-mono); font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 .75rem; }
+h1 { font-family: var(--font-display); font-size: clamp(1.6rem, 4.5vw, 2.3rem); line-height: 1.15; margin: 0 0 .75rem; text-wrap: balance; }
+.standfirst { color: var(--muted); margin: 0; max-width: 60ch; }
+h2 { font-family: var(--font-display); font-size: 1.35rem; margin: 2.75rem 0 .75rem; text-wrap: balance; }
+h3 { font-family: var(--font-display); font-size: 1.05rem; margin: 2rem 0 .5rem; text-wrap: balance; }
+h3 .chip { vertical-align: .18em; }
+p { margin: .75rem 0; }
+ul { padding-left: 1.3rem; }
+li { margin: .4rem 0; }
+code { font-family: var(--font-mono); font-size: .86em; background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1.1rem; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+a { color: var(--accent); }
+.chip { display: inline-block; font-family: var(--font-mono); font-size: .68rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; border-radius: 999px; padding: .15em .6em; margin-right: .5em; }
+.chip.bad { background: var(--bad-soft); color: var(--bad); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); }
+.chip.good { background: var(--good-soft); color: var(--good); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; margin: 1rem 0; }
+th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--font-display); font-size: .8rem; letter-spacing: .03em; text-transform: uppercase; color: var(--muted); border-bottom: 2px solid var(--fg); }
+td.num, th.num { text-align: right; }
+tr.hl td { background: var(--accent-soft); }
+tr.fail td { background: var(--bad-soft); }
+.note { border-left: 3px solid var(--accent); background: var(--surface); padding: .75rem 1rem; margin: 1.25rem 0; border-radius: 0 8px 8px 0; }
+.note p { margin: .35rem 0; }
+footer { margin-top: 3.5rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: .85rem; }
+</style>
+<main>
+<header class="doc">
+  <p class="eyebrow">Evaluation · client-side networking</p>
+  <h1>The <code>System.Net.Transport</code> proposal as a Redis client transport</h1>
+  <p class="standfirst">The Bedrock client surface, yanked from <code>dmkorolev/project-bedrock</code> and built standalone, wired into StackExchange.Redis through both of its transport seams, and run against a real redis-server. Everything here was observed by running code, not by reading the docs.</p>
+</header>
+
+<h2>What was built</h2>
+<p>The whole <code>Transport.Networking</code> tree was extracted and compiled outside arcade (epoll provider; the native shim built without OpenSSL since the client path is plaintext). On top of it, a SE.Redis <code>Tunnel</code> uses <strong>only the proposal's public client API</strong> — <code>NetworkTransportFactory.ConnectAsync</code> → <code>ConnectionContext</code> → <code>INetworkConnectionFeature</code> → <code>NetworkConnection</code> — in two shapes:</p>
+<div class="table-wrap"><table>
+<tr><th>Seam</th><th>SE.Redis API</th><th>Mapping</th></tr>
+<tr><td>Stream (shipped)</td><td><code>BeforeAuthenticateAsync → Stream</code>, no socket</td><td><code>NetworkConnection.AsStream()</code></td></tr>
+<tr><td>Transport (experimental, SER009)</td><td><code>ConnectTransportAsync → DuplexTransport</code></td><td>pull→push pump over <code>ReceiveAsync</code>/<code>AdvanceReceiveTo</code>; sends via <code>AllocateBuffer</code>+<code>EnqueueSend</code> <em>or</em> the <code>Output</code> PipeWriter</td></tr>
+</table></div>
+<p>Per scenario the harness runs 64&nbsp;KiB and 4&nbsp;MiB SET/GET round-trips, pub/sub on the second (subscription) connection, server-initiated close via <code>CLIENT KILL</code> with reconnect-through-the-tunnel, then awaited PINGs, pipelined INCR batches, and 32 parallel callers. Local redis-server, loopback, 4 engine workers, Release, .NET&nbsp;11 — indications, not benchmarks.</p>
+
+<h2>Results</h2>
+<div class="table-wrap"><table>
+<tr><th>Scenario</th><th class="num">ping µs</th><th class="num">pipelined kop/s</th><th class="num">parallel kop/s</th></tr>
+<tr><td>sockets (SE.Redis baseline)</td><td class="num">20.7</td><td class="num">538</td><td class="num">501</td></tr>
+<tr><td>stream tunnel (<code>AsStream</code>)</td><td class="num">35.0</td><td class="num">249</td><td class="num">357</td></tr>
+<tr class="fail"><td>transport · <code>EnqueueSend</code> · 1 MiB budget</td><td colspan="3">failed, by design — admission limit (finding 1.2)</td></tr>
+<tr><td>transport · <code>EnqueueSend</code> · inline receives</td><td class="num">27.5</td><td class="num">179</td><td class="num">337</td></tr>
+<tr><td>transport · <code>EnqueueSend</code> · pool receives</td><td class="num">26.9</td><td class="num">177</td><td class="num">388</td></tr>
+<tr class="hl"><td>transport · <code>Output</code> pipe · inline receives</td><td class="num">22.5</td><td class="num">604</td><td class="num">539</td></tr>
+</table></div>
+<p>Every passing scenario also passed large-value round-trips, pub/sub and kill/reconnect. The API is <strong>client-complete for Redis</strong>: connect, duplex IO, close detection and re-dial all work through the public surface with no changes to the prototype — and the pipe-output mode beat SE.Redis's tuned socket baseline on both throughput tests.</p>
+
+<h2>1 · Things that don't work</h2>
+
+<h3><span class="chip bad">blocker</span>1.1 Engine disposal deadlocks forever on an abandoned connection</h3>
+<p>After a stream-mode run, <code>NetworkTransportFactory.DisposeAsync</code> hung indefinitely. Dump autopsy: <code>EpollClient.StopAsync</code> → <code>Task.WhenAll(worker.Stopped)</code>, with the two workers that had carried connections never completing. Both connections were fully closed and drained at the native level (<code>Closed=1, Leased=0, fd=-1</code> — <code>StopConnections</code> had closed them), but a worker's loop exits only when its connection table is empty, and the <em>only</em> removal is the <code>Forget</code> command — sent solely by the consumer's <code>NetworkConnection.DisposeAsync</code>, which had never run (<code>_disposingStarted=0</code>).</p>
+<p>The trigger was a bug on <em>our</em> side — SE.Redis's <code>PhysicalConnection.Shutdown()</code> disposed the socket and the SER009 transport but never <code>_ioStream</code>, harmless for socket-backed streams but a leak for a socketless tunnel stream; fixed in our checkout. The engine behavior is still the finding: <strong>consumers with teardown bugs exist, and one leaked connection turns engine disposal into an infinite, undiagnosable hang.</strong> Suggestions: on engine dispose, forcibly reclaim connections that are natively closed but never consumer-disposed (abort + self-forget), or fail loudly after a deadline; more broadly, consider making the engine the owner of last resort, the way Kestrel's socket transport survives abandoned contexts. See also 2.4, which is how this leak class happens in practice.</p>
+
+<h3><span class="chip bad">blocker</span>1.2 The direct-send admission budget turns big payloads into connection corruption</h3>
+<p><code>EnqueueSend</code>/<code>SendAsync</code> count bytes against <code>MaxQueuedSendBytes</code> (default 1&nbsp;MiB) and <strong>throw</strong> on overflow — "an admission limit, not a wait". For a stage-then-flush client with a fire-and-forget write model, both consequences were observed:</p>
+<ul>
+<li>A single 4&nbsp;MiB <code>SET</code> deterministically kills the connection. There is no way to await admission; the only options are sizing the budget for the largest conceivable flush (we passed 16&nbsp;MiB) or failing.</li>
+<li>Worse, the throw can land <em>mid-batch</em>, after part of a framed command is already queued. The connection remains "healthy" at the transport level while the protocol stream is torn — without consumer heroics (our adapter calls <code>Abort</code> on overflow) that is a silent desync and a timeout, not a crisp failure.</li>
+</ul>
+<p>Suggestions: an awaitable admission path (<code>EnqueueSendAsync</code> or a <code>WaitToSendAsync</code> gate); a dedicated exception type; the budget on options/factory rather than only a post-connect property; and documentation of the partial-frame hazard — "a send that would exceed it throws" undersells what that does to a framed protocol.</p>
+
+<h3><span class="chip bad">blocker</span>1.3 No client TLS</h3>
+<p><code>NetworkNativeTlsOptions</code> is listener-only and the epoll client workers are constructed <code>tls:&nbsp;false</code>. For Redis — and most client scenarios — TLS is table stakes; today the tunnel must return null and fall back to sockets+<code>SslStream</code> whenever TLS is configured. Even the minimal Bedrock answer ("wrap <code>AsStream()</code> in <code>SslStream</code> yourself") deserves a stated position, because it reintroduces the Stream-adapter cost the transport seam exists to avoid — the stream-tunnel row above pays +70% ping latency and roughly half the throughput.</p>
+
+<h3><span class="chip bad">blocker</span>1.4 IPv4 TCP only, and no way to ask</h3>
+<p><code>EpollClient.ConnectAsync</code> throws for anything but IPv4 <code>IPEndPoint</code>s — no IPv6, no Unix domain sockets (very common for local Redis). Combined with Bedrock's own gap #3 (no <code>CanConnect</code> counterpart to <code>CanBind</code>), a consumer cannot even ask: our tunnel re-implements the engine's constraints by hand to decide when to fall back. <code>CanConnect(EndPoint)</code> plus UDS support would cover the real client matrix.</p>
+
+<h2>2 · Things that could be improved</h2>
+
+<h3><span class="chip warn">improve</span>2.1 The direct send queue needs coalescing — it loses to the Output pipe by 3×</h3>
+<p>The most interesting performance result. Identical workload, syscall counts via <code>strace&nbsp;-c</code>:</p>
+<div class="table-wrap"><table>
+<tr><th></th><th class="num"><code>EnqueueSend</code> mode</th><th class="num"><code>Output</code> pipe mode</th></tr>
+<tr><td><code>sendto</code> calls</td><td class="num"><strong>86,036</strong></td><td class="num"><strong>9,587</strong></td></tr>
+<tr><td>pipelined throughput</td><td class="num">179 kop/s</td><td class="num">604 kop/s</td></tr>
+</table></div>
+<p><code>PumpOutputCore</code> in direct mode submits strictly one request at a time (pin → <code>SubmitSendCore</code> → wait completion → next) and never merges adjacent queued requests, so every flushed slice is its own wire write. The pipe path wins because the <code>Pipe</code> merges flushes into large segments — and only the pipe path ever sets <code>final:&nbsp;true</code>, which is what arms <code>TCP_CORK</code> in <code>TcpConnection.Send</code>; direct sends never cork. Net effect: the API's designed-for-this fire-and-forget path does 9× the syscalls and runs ~3× slower than the adapter it was meant to beat, on exactly the pipelined small-write workload a Redis client produces.</p>
+<p>Suggestions: gather-submit queued requests (<code>writev</code>/<code>sendmsg</code> across request boundaries), or copy-merge small adjacent slices on the worker, and/or expose the cork/<code>final</code> hint on <code>EnqueueSend</code> — SE.Redis's <code>Flush()</code> is precisely that boundary, and the <code>DuplexTransport</code> contract hands it to us; we just have nowhere to put it.</p>
+<div class="note"><p>Meanwhile the pipe-output result is genuinely strong: it beat the tuned socket baseline on both throughput tests (+12% pipelined, +8% parallel) at ~2&nbsp;µs ping cost. The client story doesn't need new machinery to be competitive — it needs the direct path to catch up with the pipe path, or the guidance to say "clients: use <code>Output</code>".</p></div>
+
+<h3><span class="chip warn">improve</span>2.2 Pull-based receive forces a re-inversion for push consumers</h3>
+<p>SE.Redis's transport contract (like SocketSet's) is push: the transport delivers spans on its own schedule, with a batch-end callback for flush coalescing. <code>ReceiveAsync</code> is pull, so the adapter runs a pump loop. It works, and two design choices deserve credit: the snapshot-of-everything-unconsumed result gives a natural batch boundary (snapshot-end maps to <code>OnBatchEnd</code> and behaves), and <code>CompleteReceivesInline</code> makes the pump resume on the epoll worker — effectively push-on-worker, the SocketSet shape, at exactly the right per-connection granularity. Still, each batch pays an async state-machine cycle plus cursor bookkeeping; a first-class push option (<code>StartReceiving(handler)</code> with a real loop-drain notification) would make inline mode cheaper and the batch boundary real rather than approximated. Measured residual on loopback: ~2–7&nbsp;µs per RTT over sockets — pure adapter tax.</p>
+
+<h3><span class="chip warn">improve</span>2.3 One copy is structural for pull-parsing clients</h3>
+<p>A Redis client parses out of a contiguous rolling buffer, so transport-owned pages are copied once into the parser's buffer — the same as every SE.Redis transport today, not a regression. The zero-copy story (<code>Retain</code>/<code>NetworkPayload</code>) only pays off for consumers that parse segmented sequences in place and hold leases. Worth stating which consumers the retained-lease path is for; for SE.Redis the win was never the copy — it is scheduling (2.2) and syscalls (2.1).</p>
+
+<h3><span class="chip warn">improve</span>2.4 <code>AsStream()</code> ownership</h3>
+<p><code>AsStream()</code> is deliberately non-owning, but a Stream is frequently the <em>only</em> handle a consumer layer gets (SE.Redis tunnels, <code>SslStream</code>, Bedrock's own <code>ConnectCallback</code> — the reason <code>ConnectionContextStream</code> exists). Every such consumer must hand-write an owning wrapper or leak — see 1.1, where we hit exactly this. An <code>AsStream(ownsConnection:&nbsp;true)</code> overload is cheap and removes the sharpest edge of the shipped-seam path.</p>
+
+<h3><span class="chip warn">improve</span>2.5 Smaller client-surface nits</h3>
+<ul>
+<li><strong>Blocking <code>connect()</code> on a pool thread</strong> (<code>EpollClient</code>): fine for a prototype, but a real client API needs non-blocking connect on the worker plus a connect-timeout option — today cancellation is the only control, and SE.Redis passes <code>CancellationToken.None</code> to tunnels; the 1.1 hang was undiagnosable partly because nothing in the dial path times out.</li>
+<li><strong>Client receive window / page sizes</strong> are env vars (<code>NETWORKPROTO_CLIENT_LEASE_BYTES</code>, <code>NETWORKPROTO_CLIENT_PAGE_KB</code>); Bedrock-API.md already says the first few should become options — agreed; they are the client analogue of the Windows pool knobs.</li>
+<li><strong>Teardown-race ergonomics</strong>: during shutdown <code>EnqueueSend</code> throws <code>IOException</code>; a <code>bool TryEnqueueSend</code> (or documented closed-state behavior) would avoid try/catch as control flow in every adapter's flush path.</li>
+<li><strong><code>CompleteReceivesInline</code> showed no measurable latency win here</strong> (27.5 vs 26.9&nbsp;µs loopback ping) — unsurprising for single-connection loopback RTT; the server numbers in Bedrock.md tell the real story. Noted only so this evaluation isn't read as contradicting them.</li>
+</ul>
+
+<h2>3 · What worked well — keep exactly as-is</h2>
+<ul>
+<li><span class="chip good">keep</span><strong>The Bedrock client surface is sufficient.</strong> <code>NetworkTransportFactory</code> + <code>INetworkConnectionFeature</code> was enough to build a complete SE.Redis transport — both seams, both send modes — with zero modifications to the prototype. DNS endpoints resolve; <code>ConnectionClosed</code> and the close paths behave; pub/sub's second connection and <code>CLIENT KILL</code> reconnects flow through the tunnel correctly.</li>
+<li><span class="chip good">keep</span><strong><code>AllocateBuffer</code> + <code>NetworkBufferSlice</code> + <code>EnqueueSend</code> is the right shape</strong> for a stage-then-flush writer: refcounted pages, fire-and-forget with failure-by-closure, order preserved, caller releases immediately. SocketSet converged on the same shape independently — good evidence the shape is right; only the submission coalescing behind it lags (2.1).</li>
+<li><span class="chip good">keep</span><strong><code>CompleteReceivesInline</code> as a per-connection property</strong> composes perfectly with a multiplexing client that wants parse-on-worker for data connections and default scheduling elsewhere.</li>
+<li><span class="chip good">keep</span><strong>Engine-per-factory anchoring</strong> maps cleanly onto "one engine, N loop threads total, regardless of topology" — thread count stays a configuration constant across any number of endpoints and multiplexers.</li>
+</ul>
+
+<footer>
+<p>Prototype and harness: <code>~/code/TN</code> — <code>upstream/</code> is the pristine yank of <code>DeagleGross/aspnetcore @ dmkorolev/project-bedrock</code>; <code>src/NetworkTransport*</code> the standalone build; <code>src/TN.Redis</code> the tunnel, adapter and harness (<code>dotnet run -c Release</code>, spawns redis-server on :6399). Requires a sibling StackExchange.Redis checkout with SER009 and the <code>Shutdown()</code>/<code>_ioStream</code> fix from finding 1.1.</p>
+</footer>
+</main>

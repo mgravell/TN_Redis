@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Standalone build of upstream src/ (the providers + Bedrock layer), outside the aspnetcore
+       arcade build. Differences from upstream:
+         * FrameworkReference Microsoft.AspNetCore.App replaces arcade's Reference items;
+         * only the epoll native shim is built, from native-nossl.c (TLS exports stubbed: no
+           OpenSSL dev headers here, and the client path is plaintext);
+         * the io_uring shims are not built (no liburing); the C# for those providers still
+           compiles, those engines just cannot be instantiated. -->
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>$(NoWarn);SYSLIB5007;CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../NetworkTransport.Primitives/NetworkTransport.Primitives.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../../upstream/src/**/*.cs" />
+    <Compile Include="../../upstream/DuplexPipe.cs" Link="Internal/DuplexPipe.cs" />
+    <None Include="$(IntermediateOutputPath)libnetworkprotoepoll.so" Link="libnetworkprotoepoll.so" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="BuildEpollShim" BeforeTargets="CoreCompile"
+          Inputs="$(MSBuildProjectDirectory)/native-nossl.c" Outputs="$(IntermediateOutputPath)libnetworkprotoepoll.so">
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <Exec Command="cc -std=c11 -O2 -g -Wall -Wextra -Werror -fPIC -shared &quot;$(MSBuildProjectDirectory)/native-nossl.c&quot; -o &quot;$(IntermediateOutputPath)libnetworkprotoepoll.so&quot;" />
+  </Target>
+</Project>

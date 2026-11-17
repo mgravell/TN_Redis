@@ -1,0 +1,622 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Linq;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Threading.Channels;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Networking.Shared;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.Networking.Windows;
+
+namespace Microsoft.AspNetCore.Server.Kestrel.Transport.Networking.Epoll;
+
+internal sealed class EpollWorker
+{
+    internal const int PageCount = 2048, PageSize = 16384;
+    private const ulong ListenerId = 1, WakeId = 2;
+    internal enum CommandKind { OutputReady, ReturnPage, Close, Forget, Unbind, Stop, Connected }
+    internal readonly record struct Command(CommandKind Kind, ConnectionState? State = null, int Page = 0, int Fd = -1, IPEndPoint? Remote = null,
+        TaskCompletionSource<IProviderConnection>? Connect = null);
+
+    private readonly ConcurrentQueue<Command> _commands = new();
+    private readonly Dictionary<ulong, ConnectionState> _connections = new();
+    private readonly TaskCompletionSource _started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _stopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly Lock _wakeGate = new();
+    private readonly ChannelWriter<IProviderConnection> _accepted;
+    private readonly IPEndPoint? _endpoint;
+    private readonly int _cpu;
+    // Client workers read whole responses per syscall, so they use fewer, larger pages from a pool of the same total size.
+    private static readonly int ClientPageBytes = int.Parse(Environment.GetEnvironmentVariable("NETWORKPROTO_CLIENT_PAGE_KB") ?? "64", CultureInfo.InvariantCulture) * 1024;
+    private readonly byte[] _pages;
+    private readonly ulong[] _pageOwners;
+    private readonly Stack<int> _freePages;
+    private readonly int _pageCount;
+    private int _epoll = -1, _listener = -1, _wake = -1, _pumpThread, _wakeScheduled;
+    private nint _context;
+    private SessionTlsContext? _sessionContext;
+    private bool _disposed, _stopping, _resumePages;
+    private ulong _nextId = WakeId;
+    private int _pendingRejections;
+    private long _acceptResumeAt;
+    private bool _acceptFailing;
+    private const int AcceptRetryMilliseconds = 50;
+    private long _iterations, _wakes, _commandsProcessed, _pagesRead, _bytes, _sendCommands, _finalSendCommands;
+    private long _rejectedAccepts, _rejectedDisposed;
+    private readonly bool _coalesced;
+    private readonly int _sendBufferSize = int.Parse(Environment.GetEnvironmentVariable("NETWORKPROTO_EPOLL_SNDBUF") ?? "0", CultureInfo.InvariantCulture);
+    internal readonly bool FinalSendEnabled = Environment.GetEnvironmentVariable("NETWORKPROTO_FINAL_SEND") is "1" or "2" or "3";
+    internal readonly bool CorkFinal = Environment.GetEnvironmentVariable("NETWORKPROTO_FINAL_SEND") == "3";
+    internal readonly Counters Metrics = new();
+    internal readonly ILogger Logger;
+    internal NativeMemoryPool? OutputPool { get; }
+    internal int PageBytes { get; }
+    internal bool Tls { get; }
+    internal bool Shared { get; }
+    internal Action<ReadOnlySpan<byte>>? HandshakePrefixCallback { get; }
+
+    internal Task Started => _started.Task;
+    internal Task Stopped => _stopped.Task;
+    internal long WakeWrites => Volatile.Read(ref _wakes);
+    internal long CommandsProcessed => Volatile.Read(ref _commandsProcessed);
+    internal long Iterations => Volatile.Read(ref _iterations);
+    internal int ConnectionCount => _connections.Count;
+
+    // A null endpoint makes this a client worker: it never listens and only adopts sockets connected by EpollClient.
+    internal EpollWorker(IPEndPoint? endpoint, int cpu, bool tls, string certificate, string key, ChannelWriter<IProviderConnection> accepted, ILogger logger, bool shared = false,
+        Action<ReadOnlySpan<byte>>? handshakePrefixCallback = null)
+    {
+        _endpoint = endpoint;
+        _cpu = cpu;
+        var client = endpoint is null;
+        PageBytes = client ? ClientPageBytes : PageSize;
+        _pageCount = client ? PageCount * PageSize / PageBytes : PageCount;
+        _pages = GC.AllocateUninitializedArray<byte>(_pageCount * PageBytes, pinned: true);
+        _pageOwners = new ulong[_pageCount];
+        _freePages = new Stack<int>(Enumerable.Range(0, _pageCount));
+        // Joining a pending wake is a pure saving (one eventfd write per command instead of one per request), so it is the default for servers and clients; NETWORKPROTO_COALESCE=0 restores a wake per command.
+        _coalesced = Environment.GetEnvironmentVariable("NETWORKPROTO_COALESCE") is not "0";
+        Tls = tls;
+        Shared = shared;
+        if (shared && AdaptiveOutputPool.Enabled)
+        {
+            OutputPool = new NativeMemoryPool(null, 512 * 1024 * 1024, pageSize: 4096);
+        }
+        HandshakePrefixCallback = handshakePrefixCallback;
+        _accepted = accepted;
+        Logger = logger;
+        if (!client)
+        {
+            EpollDiagnostics.RegisterIfRequested(this);
+        }
+        using (ExecutionContext.SuppressFlow())
+        {
+            new Thread(() => Run(certificate, key)) { IsBackground = true, Name = $"Epoll {(tls ? "TLS" : "TCP")} CPU {cpu}" }.Start();
+        }
+    }
+
+    internal void Enqueue(Command command)
+    {
+        _commands.Enqueue(command);
+        if (_coalesced && (Environment.CurrentManagedThreadId == _pumpThread || Interlocked.Exchange(ref _wakeScheduled, 1) != 0))
+        {
+            return;
+        }
+        lock (_wakeGate)
+        {
+            if (!_disposed && _wake >= 0)
+            {
+                Interlocked.Increment(ref _wakes);
+                Native.Check(Native.Wake(_wake), "wake");
+            }
+        }
+    }
+
+    internal void Stop() => Enqueue(new(CommandKind.Stop));
+
+    private unsafe void Run(string certificate, string key)
+    {
+        Exception? failure = null;
+        try
+        {
+            _pumpThread = Environment.CurrentManagedThreadId;
+            ArgumentOutOfRangeException.ThrowIfNegative(_sendBufferSize);
+            Native.Check(Native.SetCpu(_cpu), "affinity");
+            if (Tls && SessionTlsContext.IsSelected)
+            {
+                _sessionContext = new SessionTlsContext(certificate, key);
+            }
+            else if (Tls)
+            {
+                _context = Native.CreateContext(certificate, key, out var error);
+                if (_context == 0)
+                {
+                    throw new IOException($"OpenSSL context creation failed: 0x{error:x}.");
+                }
+            }
+            _epoll = Native.Check(Native.Create(), "create");
+            _wake = Native.Check(Native.CreateWake(), "eventfd");
+            _listener = _endpoint is null ? -1 : Native.Check(Native.Listen(BinaryPrimitives.ReadUInt32BigEndian(_endpoint.Address.GetAddressBytes()), _endpoint.Port), "listen");
+            Control(Native.Add, _wake, Native.Readable, WakeId);
+            if (_listener >= 0)
+            {
+                Control(Native.Add, _listener, Native.Readable, ListenerId);
+            }
+            if (Tls)
+            {
+                if (TransportDiagnostics.Enabled)
+                {
+                    Console.WriteLine($"EPOLL_TLS_LIBRARY version=\"{Marshal.PtrToStringUTF8(Native.Version())}\" impl={(_sessionContext is null ? "native" : "session")} cpu={_cpu} batch=128 managed=true");
+                }
+            }
+            _started.SetResult();
+            var events = new Native.ReadyEvent[128];
+            long nextSweep = 0;
+            while (!_stopping || _connections.Count != 0 || !_commands.IsEmpty || Volatile.Read(ref _pendingRejections) != 0)
+            {
+                try
+                {
+                    // A producer either joins this drain or leaves a wake for the next wait.
+                    Volatile.Write(ref _wakeScheduled, 0);
+                    if (_acceptResumeAt != 0 && Environment.TickCount64 >= _acceptResumeAt)
+                    {
+                        ResumeAccepting();
+                    }
+                    for (var i = 0; i < 1024 && _commands.TryDequeue(out var command); i++)
+                    {
+                        _commandsProcessed++;
+                        Process(command);
+                    }
+                    ResumeReaders();
+                    fixed (Native.ReadyEvent* pointer = events)
+                    {
+                        Metrics.WaitCalls++;
+                        var count = Native.Check(Native.Wait(_epoll, pointer, events.Length, _commands.IsEmpty ? 10 : 0), "wait");
+                        for (var i = 0; i < count; i++)
+                        {
+                            Dispatch(events[i]);
+                        }
+                    }
+                    _iterations++;
+                    var now = Environment.TickCount64;
+                    if (Tls && now >= nextSweep)
+                    {
+                        nextSweep = now + 1000;
+                        foreach (var state in _connections.Values.ToArray())
+                        {
+                            state.CheckDeadline(now);
+                        }
+                    }
+                }
+                catch (Exception errorInPump)
+                {
+                    failure ??= errorInPump;
+                    Logger.LogError(errorInPump, "Epoll worker failed; stopping its connections.");
+                    _accepted.TryComplete(errorInPump);
+                    StopConnections(errorInPump);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            failure ??= error;
+            Logger.LogError(error, "Epoll worker initialization failed.");
+            _started.TrySetException(error);
+            _accepted.TryComplete(error);
+        }
+        finally
+        {
+            lock (_wakeGate)
+            {
+                _disposed = true;
+                CloseDescriptor(ref _listener);
+                CloseDescriptor(ref _wake);
+                CloseDescriptor(ref _epoll);
+            }
+            if (_context != 0)
+            {
+                Native.FreeContext(_context);
+            }
+            _sessionContext?.Dispose();
+            if (OutputPool is { Outstanding: 0 } outputPool)
+            {
+                outputPool.Dispose();
+            }
+            if (_connections.Count != 0 || _freePages.Count != _pageCount)
+            {
+                failure ??= new InvalidOperationException("Epoll stopped with outstanding connection/page ownership.");
+                Logger.LogError(failure, "Epoll ownership did not drain.");
+            }
+            Report();
+            if (failure is null)
+            {
+                _stopped.TrySetResult();
+            }
+            else
+            {
+                _stopped.TrySetException(failure);
+            }
+        }
+    }
+
+    private void Dispatch(Native.ReadyEvent ready)
+    {
+        Metrics.ReadyEvents++;
+        if (ready.Id == WakeId)
+        {
+            Native.Check(Native.DrainWake(_wake), "drain wake");
+            Metrics.WakeReads++;
+        }
+        else if (ready.Id == ListenerId)
+        {
+            Accept();
+        }
+        else if (_connections.TryGetValue(ready.Id, out var state))
+        {
+            var mask = ready.Events;
+            if ((mask & (Native.Error | Native.Hangup)) != 0)
+            {
+                mask |= Native.Readable | Native.Writable;
+            }
+            state.Drive(mask);
+        }
+        // A closed/reused fd cannot alias an old event: registrations carry monotonic IDs.
+    }
+
+    private void Accept()
+    {
+        for (var i = 0; i < 64 && _listener >= 0; i++)
+        {
+            var fd = Native.Accept(_listener);
+            if (fd == Native.Again)
+            {
+                return;
+            }
+            if (fd is Native.Interrupted or Native.ConnectionAborted)
+            {
+                continue;
+            }
+            if (Native.IsTransientAcceptFailure(fd))
+            {
+                PauseAccepting(fd);
+                return;
+            }
+            Native.Check(fd, "accept");
+            _acceptFailing = false;
+            Metrics.Accepts++;
+            var local = SocketEndpoints.TryGet(fd, peer: false);
+            var remote = SocketEndpoints.TryGet(fd, peer: true);
+            if (local is null || remote is null)
+            {
+                // The peer reset between accept and adoption, so there is no connection left to publish.
+                CloseDescriptor(ref fd);
+                Metrics.Closed++;
+                continue;
+            }
+            nint session = 0;
+            SessionTls? managed = null;
+            try
+            {
+                Native.Check(Native.SetSocketOption(fd, Native.SocketOption.NoDelay, 1), "TCP_NODELAY");
+                if (_sendBufferSize > 0)
+                {
+                    Native.Check(Native.SetSocketOption(fd, Native.SocketOption.SendBuffer, _sendBufferSize), "SO_SNDBUF");
+                }
+                if (_sessionContext is not null)
+                {
+                    managed = _sessionContext.CreateSession(fd);
+                }
+                else if (Tls)
+                {
+                    session = Native.CreateSession(_context, fd, out var error);
+                    if (session == 0)
+                    {
+                        throw new IOException($"OpenSSL session creation failed: 0x{error:x}.");
+                    }
+                }
+            }
+            catch
+            {
+                if (session != 0)
+                {
+                    Native.FreeSession(session);
+                }
+                managed?.Dispose();
+                CloseDescriptor(ref fd);
+                Metrics.Closed++;
+                throw;
+            }
+            var id = checked(++_nextId);
+            ConnectionState state = Tls
+                ? new TlsConnection(this, id, fd, local, remote, session, managed)
+                : new TcpConnection(this, id, fd, local, remote);
+            _connections.Add(state.Id, state);
+            state.Drive(Native.Readable | Native.Writable);
+        }
+    }
+
+    // Running out of descriptors or memory is transient: the connection stays in the kernel backlog until the worker listens again.
+    // Level-triggered epoll would report the listener on every wait, so the worker stops listening for a short time instead of spinning or failing.
+    private void PauseAccepting(int error)
+    {
+        Metrics.AcceptFailures++;
+        if (!_acceptFailing)
+        {
+            _acceptFailing = true;
+            Logger.LogWarning("Epoll accept failed with errno {Error}; accepting pauses for {Delay} ms and retries.", -error, AcceptRetryMilliseconds);
+        }
+        Control(Native.Delete, _listener, 0, ListenerId);
+        _acceptResumeAt = Environment.TickCount64 + AcceptRetryMilliseconds;
+    }
+
+    private void ResumeAccepting()
+    {
+        _acceptResumeAt = 0;
+        if (_listener >= 0 && !_stopping)
+        {
+            Control(Native.Add, _listener, Native.Readable, ListenerId);
+        }
+    }
+
+    private void Process(Command command)
+    {
+        if (command.Kind == CommandKind.Unbind)
+        {
+            StopAccepting();
+            return;
+        }
+        if (command.Kind == CommandKind.Stop)
+        {
+            StopConnections(null);
+            return;
+        }
+        if (command.Kind == CommandKind.Connected)
+        {
+            AdoptConnected(command.Fd, command.Remote!, command.Connect!);
+            return;
+        }
+        var state = command.State;
+        if (state is null)
+        {
+            throw new InvalidOperationException($"Command {command.Kind} requires an epoll connection.");
+        }
+        switch (command.Kind)
+        {
+            case CommandKind.OutputReady:
+                state.Application!.PumpOutput();
+                break;
+            case CommandKind.ReturnPage:
+                state.ReturnPage(command.Page);
+                break;
+            case CommandKind.Close:
+                state.RequestClose();
+                break;
+            case CommandKind.Forget:
+                if (!state.Closed || state.Leased != 0)
+                {
+                    throw new InvalidOperationException("Epoll connection forgotten before its memory was returned.");
+                }
+                _connections.Remove(state.Id);
+                break;
+            default:
+                throw new InvalidOperationException($"Unexpected epoll command {command.Kind}.");
+        }
+    }
+
+    private void StopAccepting()
+    {
+        if (_listener >= 0)
+        {
+            if (_acceptResumeAt == 0)
+            {
+                Control(Native.Delete, _listener, 0, ListenerId);
+            }
+            _acceptResumeAt = 0;
+            CloseDescriptor(ref _listener);
+        }
+    }
+
+    private void StopConnections(Exception? error)
+    {
+        _stopping = true;
+        StopAccepting();
+        foreach (var state in _connections.Values.ToArray())
+        {
+            state.Finish(error ?? new ConnectionAbortedException("Epoll worker stopped."));
+            state.Application?.Abort(new ConnectionAbortedException("Epoll worker stopped."));
+        }
+    }
+
+    internal void Control(int operation, int fd, uint events, ulong id)
+    {
+        Metrics.ControlCalls++;
+        Native.Check(Native.Control(_epoll, operation, fd, events, id), "control");
+    }
+
+    internal void Send(ConnectionState state, nint data, int length, bool final)
+    {
+        _sendCommands++;
+        if (final)
+        {
+            _finalSendCommands++;
+        }
+        state.Send(data, length, final);
+    }
+
+    internal IProviderConnection Publish(ConnectionState state)
+    {
+        IProviderConnection connection = Shared ? ProviderNetworkConnection.ForEpoll(this, state) : new Connection(this, state);
+        if (!_accepted.TryWrite(connection))
+        {
+            _rejectedAccepts++;
+            Interlocked.Increment(ref _pendingRejections);
+            connection.Abort(new ConnectionAbortedException("Listener stopped."));
+            _ = DisposeRejectedAsync(connection);
+        }
+        return connection;
+    }
+
+    // Outbound sockets are connected by EpollClient and adopted like accepted ones, except that the caller is completed instead of the accept channel.
+    private void AdoptConnected(int fd, IPEndPoint remote, TaskCompletionSource<IProviderConnection> completion)
+    {
+        if (_stopping)
+        {
+            CloseDescriptor(ref fd);
+            completion.TrySetException(new ObjectDisposedException(nameof(EpollWorker)));
+            return;
+        }
+        var local = SocketEndpoints.TryGet(fd, peer: false);
+        if (local is null)
+        {
+            CloseDescriptor(ref fd);
+            completion.TrySetException(new IOException("The connected socket has no local endpoint."));
+            return;
+        }
+        var id = checked(++_nextId);
+        var state = new TcpConnection(this, id, fd, local, remote, completion);
+        _connections.Add(id, state);
+        state.Drive(Native.Readable | Native.Writable);
+    }
+
+    internal IProviderConnection PublishClient(ConnectionState state, TaskCompletionSource<IProviderConnection> completion)
+    {
+        var connection = ProviderNetworkConnection.ForEpoll(this, state);
+        if (!completion.TrySetResult(connection))
+        {
+            connection.Abort(new ConnectionAbortedException("Connect was abandoned."));
+            Interlocked.Increment(ref _pendingRejections);
+            _ = DisposeRejectedAsync(connection);
+        }
+        return connection;
+    }
+
+    private async Task DisposeRejectedAsync(IProviderConnection connection)
+    {
+        try
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            Interlocked.Increment(ref _rejectedDisposed);
+        }
+        catch (Exception error)
+        {
+            Logger.LogError(error, "Rejected epoll connection disposal failed.");
+            _stopped.TrySetException(error);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _pendingRejections);
+        }
+    }
+
+    internal void RemoveUnpublished(ulong id) => _connections.Remove(id);
+
+    internal int RentPage(ulong owner)
+    {
+        if (!_freePages.TryPop(out var page))
+        {
+            return -1;
+        }
+        if (_pageOwners[page] != 0)
+        {
+            throw new InvalidOperationException("Epoll page was already owned.");
+        }
+        _pageOwners[page] = owner;
+        return page;
+    }
+
+    internal Memory<byte> Page(int page) => _pages.AsMemory(page * PageBytes, PageBytes);
+
+    internal void OfferPage(ulong owner, int page)
+    {
+        if ((uint)page >= (uint)_pageCount || _pageOwners[page] != owner)
+        {
+            throw new InvalidOperationException("Epoll page returned by the wrong connection.");
+        }
+        _pageOwners[page] = 0;
+        _resumePages |= _freePages.Count == 0;
+        _freePages.Push(page);
+    }
+
+    private void ResumeReaders()
+    {
+        if (!_resumePages)
+        {
+            return;
+        }
+        _resumePages = false;
+        foreach (var state in _connections.Values.ToArray())
+        {
+            if (_freePages.Count == 0)
+            {
+                break;
+            }
+            state.ResumeForPool();
+        }
+    }
+
+    internal void Received(IProviderConnection application, int page, int length)
+    {
+        _pagesRead++;
+        _bytes += length;
+        if (application is ProviderNetworkConnection shared)
+        {
+            shared.Receive(Page(page), length, page);
+        }
+        else
+        {
+            ((Connection)application).Input.Append(Page(page)[..length], page);
+        }
+    }
+
+    internal void CloseDescriptor(ref int fd)
+    {
+        if (fd >= 0)
+        {
+            var result = Native.Close(fd);
+            fd = -1;
+            if (result < 0)
+            {
+                Logger.LogError("Epoll close failed: {Error}", result);
+            }
+        }
+    }
+
+    private void Report()
+    {
+        if (!TransportDiagnostics.Enabled)
+        {
+            return;
+        }
+        Console.WriteLine("OWNED_METRICS " + JsonSerializer.Serialize(new
+        {
+            cpu = _cpu, tls = Tls, layered = false, epoll = true, managedEngine = true, coalesced = _coalesced,
+            pumpIterations = _iterations, stepInterop = 0, wakeInterop = _wakes, commands = _commandsProcessed,
+            pages = _pagesRead, bytes = _bytes, acceptSqes = 0, receiveSqes = 0, sendSqes = 0, pollSqes = 0, cqes = 0,
+            nativeSubmitWaitCalls = 0, returnedPages = Metrics.ReturnedPages, sslReads = Metrics.SslReads,
+            receiveAdapterCopyBytes = 0, rejectedAccepts = _rejectedAccepts, rejectedAcceptsDisposed = _rejectedDisposed,
+            sendCommands = _sendCommands, finalSendCommands = _finalSendCommands,
+            liveConnections = _connections.Count, leasedPages = _pageCount - _freePages.Count
+        }));
+        Console.WriteLine("EPOLL_METRICS " + JsonSerializer.Serialize(Metrics, new JsonSerializerOptions { IncludeFields = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+        Console.WriteLine("EPOLL_FINAL_SEND_METRICS " + JsonSerializer.Serialize(new
+        {
+            shutdowns = Metrics.FinalShutdowns, closeNotify = Metrics.CloseNotify, shutdownFailures = Metrics.ShutdownFailures,
+            corks = Metrics.Corks, shutdownNotConnected = Metrics.NotConnected
+        }));
+    }
+
+    internal sealed class Counters
+    {
+        public long Accepts, AcceptFailures, Handshakes, WaitCalls, ReadyEvents, ControlCalls, WakeReads;
+        public long SslReads, ReadSuccess, SslWrites, WriteSuccess, WantRead, WantWrite, WriteRetries, ReturnedPages;
+        public long Closed, PeerAborts, TlsErrors, HandshakeTimeouts, ShutdownTimeouts, ReadPauses, PageResumes;
+        public long Corks, FinalShutdowns, CloseNotify, ShutdownFailures, NotConnected;
+        public long RecvCalls, SendCalls, RecvBytes, SendBytes, ReceiveWouldBlock, SendWouldBlock, PartialSends, ReadEofs, SocketErrors;
+    }
+}
